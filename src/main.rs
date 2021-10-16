@@ -1,72 +1,79 @@
-use futures::prelude::*;
-use std::convert::TryInto;
-use std::future::ready;
+use zbus::{MessageHeader, ObjectServer, SignalContext, dbus_interface, Connection};
+use std::collections::HashMap;
+use std::time::Duration;
+use std::sync::Mutex;
+
+#[derive(Debug, Default)]
+struct IdleMapper {
+    shared: Mutex<IdleMapperShared>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IdleMapperShared {
+    cookie_idx: u32,
+    inhibits_by_cookie: HashMap<u32, FdoInhibit>
+}
+
+#[derive(Debug, Clone)]
+struct FdoInhibit {
+    // FIXME: we need to track the peer which created this inhibit, otherwise they'll leak
+
+    application_name: String,
+    reason_for_inhibit: String,
+    cookie: u32,
+}
+
+#[dbus_interface(name = "org.freedesktop.ScreenSaver")]
+impl IdleMapper {
+    #[dbus_interface(out_args("cookie"))]
+    async fn inhibit(
+        &self,
+        application_name: &str,
+        reason_for_inhibit: &str,
+    ) -> zbus::fdo::Result<u32> {
+        let mut ims = self.shared.lock().unwrap();
+        let cookie = ims.cookie_idx;
+        ims.cookie_idx += 1;
+        let inhibit = FdoInhibit {
+            application_name: application_name.to_owned(),
+            reason_for_inhibit: reason_for_inhibit.to_owned(),
+            cookie,
+        };
+        if let Some(old_inhibit) = ims.inhibits_by_cookie.insert(cookie, inhibit) {
+            panic!("cookie conflict: {} -> {:?}", cookie, old_inhibit);
+        }
+        Ok(cookie)
+    }
+
+    async fn uninhibit(
+        &self,
+        cookie: u32,
+    ) -> zbus::fdo::Result<()> {
+        let mut ims = self.shared.lock().unwrap();
+
+        if let None = ims.inhibits_by_cookie.remove(&cookie) {
+            Err(zbus::fdo::Error::FileNotFound(format!("cookie {} not in inhibits", cookie)))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send + 'static>> {
-    let conn = zbus::azync::Connection::new_session().await?;
+    let conn = Connection::session().await?;
+    let interface = IdleMapper::default();
+    conn
+        .object_server_mut()
+        .await
+        .at("/org/freedesktop/ScreenSaver", interface)?;
 
-    let t = {
-        let conn = conn.clone();
-        tokio::task::spawn(async move {
-            loop {
-                let op = "/org/freedesktop/ScreenSaver".try_into().unwrap();
-
-                let pred = |message: &zbus::Message| -> Result<bool, zbus::Error> {
-                    // check if message is our object
-                    let header = message.header()?;
-
-                    if header.message_type()? != zbus::MessageType::MethodCall {
-                        println!("type not right: {:?}", message);
-                        return Ok(false);
-                    }
-
-                    // is this an object we have?
-                    if header.path()? != Some(&op) {
-                        println!("path unhandled: {:?}", message);
-                        return Ok(false);
-                    }
-
-                    Ok(true)
-                };
-                let message = conn.receive_specific(|message| {
-                    ready(pred(message)).boxed()
-                }).await.unwrap();
-
-                let header = message.header().unwrap();
-
-                // do we impliment this interface for that object? If not, return an error
-                if header.interface().unwrap() != Some("org.freedesktop.ScreenSaver") {
-                    println!("interface unhandled: {:?}", message);
-                    todo!();
-                }
-
-                // does this interface impliment the requested method? If not, return an error
-                if header.member().unwrap() != Some("Inhbit") {
-                    todo!();
-                }
-
-                // does the type signature match? alternately: does deserialization work?
-                // "su"
-                let body: (String, u32) = message.body().unwrap();
-
-                println!("BODY: {:?}", body);
-            }
-        })
-    };
-
-    conn.call_method(
-        Some("org.freedesktop.DBus"),
-        "/org/freedesktop/DBus",
-        Some("org.freedesktop.DBus"),
-        "RequestName",
-        &("com.codyps.IdleMapper", 0u32)
-    ).await?;
+    conn.request_name("com.codyps.IdleMapper").await?;
 
     println!("got name");
 
-
-    t.await?;
-
-    Ok(())
+    // TODO: find a nicer way to do this without awaiting on timers
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
 }
